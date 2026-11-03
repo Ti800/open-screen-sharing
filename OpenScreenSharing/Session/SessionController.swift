@@ -157,6 +157,7 @@ final class SessionController: Identifiable {
     @PerceptionIgnored private var textFieldFocused = false
     @PerceptionIgnored private var pointerNudged = false
     @PerceptionIgnored private var textInputCheck: Task<Void, Never>?
+    @PerceptionIgnored private var textInputKeyboard: Task<Void, Never>?
     #endif
     private(set) var imageSize: CGSize = .zero
     private(set) var picture = ScreenPicture.none
@@ -1881,6 +1882,17 @@ final class SessionController: Identifiable {
     private func guessLockScreen(secureInputRose: Bool) {
         let now = ProcessInfo.processInfo.systemUptime
         if secureInputRose { secureInputRoseAt = now }
+        #if os(iOS)
+        let wasLocked = remoteSeemsLocked
+        defer {
+            // Drops the keyboard waiting for a tap that locked the Mac, and the field it found, which isn't one to
+            // come back to once the Mac is unlocked. Tapping the lock screen's password field still shows it.
+            if remoteSeemsLocked, !wasLocked {
+                forgetTextInput()
+                textFieldFocused = false
+            }
+        }
+        #endif
         // Only Screen Sharing on a Mac reports secure input this way; an iPhone or iPad shares no lock screen to type into.
         guard secureInput, info.dialect == .apple, platform == .mac else {
             remoteSeemsLocked = false
@@ -2000,6 +2012,12 @@ final class SessionController: Identifiable {
             && !isKeyboardVisible
     }
 
+    /// Locking the Mac turns on secure input as a password field does, and a tap that locks it, as on Lock Screen in
+    /// the Apple menu, would show the keyboard over the lock screen, where the unlock banner is meant instead. The
+    /// layout that tells a lock arrives up to about 0.6 s apart from secure input, so with secure input on the
+    /// keyboard waits for it. A tap on the password field of a lock screen already told shows it right away.
+    private static let lockScreenWait: TimeInterval = 0.8
+
     /// Counts pointer input other than the nudge, so a check is dropped once the pointer moves, a button is pressed
     /// or the picture scrolls after the tap. Scrolling moves the field found by an earlier tap away too.
     private func notePointerInput(scrolls: Bool = false) {
@@ -2076,7 +2094,18 @@ final class SessionController: Identifiable {
         textInputClick = nil
         tappedTextField = (click.point, CACurrentMediaTime())
         textFieldFocused = true
-        if click.opensKeyboard { showKeyboardForTextInput() }
+        guard click.opensKeyboard else { return }
+        guard secureInput, !remoteSeemsLocked else {
+            showKeyboardForTextInput()
+            return
+        }
+        textInputKeyboard?.cancel()
+        textInputKeyboard = Task { [weak self] in
+            try? await Task.sleep(seconds: Self.lockScreenWait)
+            guard !Task.isCancelled, let self else { return }
+            self.textInputKeyboard = nil
+            self.showKeyboardForTextInput()
+        }
     }
 
     private func showKeyboardForTextInput() {
@@ -2088,6 +2117,8 @@ final class SessionController: Identifiable {
         textInputClick = nil
         textInputCheck?.cancel()
         textInputCheck = nil
+        textInputKeyboard?.cancel()
+        textInputKeyboard = nil
         if pointerNudged {
             pointerNudged = false
             _ = nudgePointer(back: true)
