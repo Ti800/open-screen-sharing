@@ -35,6 +35,9 @@ struct CredentialPrompt: Identifiable {
     var remembers: Bool
     var failed: Bool
     var errorMessage = ""
+    var server: ProbedServer
+    var computerID: UUID?
+    var allowsUnverifiedLogin: Bool
 }
 
 struct UserPasswordPrompt: Identifiable {
@@ -276,6 +279,10 @@ final class SessionController: Identifiable {
     @PerceptionIgnored private var screenRefreshRate = 60
     private let virtualDisplayRequests = VirtualDisplayRequests()
     @PerceptionIgnored private(set) var sceneInBackground = false
+    @PerceptionIgnored private var keepsAlive = false
+    @PerceptionIgnored private var screenVisible = true
+    @PerceptionIgnored private var localScreensAsleep = false
+    @PerceptionIgnored nonisolated(unsafe) private var screenSleepObservers: [any NSObjectProtocol] = []
     @PerceptionIgnored private var activeWhenBackgrounded = false
     #if os(iOS)
     @PerceptionIgnored private var backgroundTask = UIBackgroundTaskIdentifier.invalid
@@ -339,6 +346,18 @@ final class SessionController: Identifiable {
         deviceType = route.deviceType ?? route.model.flatMap(DeviceType.init(model:))
         windowSize = route.computerID.flatMap { store.stored($0) }?.memory.windowSize
         virtualDisplayRequests.onIdle = { [weak self] in self?.virtualDisplayDidSettle() }
+        #if os(macOS)
+        let workspace = NSWorkspace.shared.notificationCenter
+        for (name, asleep) in [(NSWorkspace.screensDidSleepNotification, true), (NSWorkspace.screensDidWakeNotification, false)] {
+            screenSleepObservers.append(
+                workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.localScreensAsleep = asleep
+                        self?.updateRemoteWakefulness()
+                    }
+                })
+        }
+        #endif
         pipeline.setShownHandler { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -346,6 +365,10 @@ final class SessionController: Identifiable {
                 self.handle(picture: shown.picture, width: shown.width, height: shown.height, turns: shown.turns)
             }
         }
+    }
+
+    deinit {
+        for observer in screenSleepObservers { NotificationCenter.default.removeObserver(observer) }
     }
 
 
@@ -415,7 +438,10 @@ final class SessionController: Identifiable {
             return
         }
         credentialPrompt = CredentialPrompt(
-            form: form, username: username, remembers: usedSavedPassword, failed: failure != nil, errorMessage: failure?.message ?? "")
+            form: form, username: username, remembers: usedSavedPassword, failed: failure != nil, errorMessage: failure?.message ?? "",
+            server: ProbedServer(
+                address: route.address, remoteProtocol: route.remoteProtocol, authentication: server, fingerprint: trustedFingerprint),
+            computerID: computerID, allowsUnverifiedLogin: allowsUnverifiedLogin)
     }
 
     func submitCredentials(_ credentials: SessionCredentials, remember: Bool) {
@@ -566,8 +592,10 @@ final class SessionController: Identifiable {
         if sceneInBackground {
             sink.setSceneInBackground(true)
         }
+        self.keepsAlive = keepsAlive
         self.session = session
         self.sink = sink
+        updateRemoteWakefulness()
         virtualDisplayRequests.reset(widthMultiple: session.displayWidthMultiple, sizedByConnection: route.remoteProtocol == .rdp) {
             [weak self, weak session] mode in
             guard let self else { return }
@@ -701,6 +729,7 @@ final class SessionController: Identifiable {
         stopScrollMomentum()
         updateMicrophone()
         sink?.setSceneInBackground(true)
+        updateRemoteWakefulness()
         #if os(iOS)
         screen?.backgroundStateDidChange()
         #endif
@@ -718,6 +747,7 @@ final class SessionController: Identifiable {
         sceneInBackground = false
         endBackgroundTask()
         sink?.setSceneInBackground(false)
+        updateRemoteWakefulness()
         updateMicrophone()
         #if os(iOS)
         screen?.backgroundStateDidChange()
@@ -739,6 +769,16 @@ final class SessionController: Identifiable {
         } else if reconnectsOnReturn || wasActive && brokeInBackground {
             reconnectNow()
         }
+    }
+
+    func setScreenVisible(_ visible: Bool) {
+        guard screenVisible != visible else { return }
+        screenVisible = visible
+        updateRemoteWakefulness()
+    }
+
+    private func updateRemoteWakefulness() {
+        session?.setKeepsAwake(keepsAlive || !sceneInBackground && screenVisible && !localScreensAsleep)
     }
 
     private func beginBackgroundTask() {

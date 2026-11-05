@@ -192,9 +192,11 @@ struct ComputerEditor: View {
                         Text("Type User Password types this into the lock screen or login window. It’s kept in the Keychain on this device.")
                     }
                 }
-                if choice == .rdp {
+                if choice == .rdp || choice == .appleVNC {
                     Section {
-                        Toggle("Disable UDP", isOn: $disablesUDP)
+                        if choice == .rdp {
+                            Toggle("Disable UDP", isOn: $disablesUDP)
+                        }
                         Toggle("Keep Alive", isOn: $keepsAlive)
                     } header: {
                         Text("Connection")
